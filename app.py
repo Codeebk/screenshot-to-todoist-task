@@ -1,5 +1,7 @@
 import os
 import base64
+import json
+import uuid
 import requests
 from typing import Optional
 
@@ -16,6 +18,13 @@ TODOIST_TOKEN = (os.environ.get("TODOIST_TOKEN") or "").strip()
 # Todoist Quick Add (Sync API v9) – deprecated but still the easiest way to parse natural language
 # You can swap this later if Todoist changes it.
 TODOIST_QUICK_ADD_URL = "https://api.todoist.com/sync/v9/quick/add"
+
+# Sync + Upload endpoints (used for attaching screenshots)
+TODOIST_SYNC_URL = "https://api.todoist.com/sync/v9/sync"
+TODOIST_UPLOAD_URL = "https://api.todoist.com/sync/v9/uploads/add"
+
+# Toggle screenshot attachment behavior
+ATTACH_SCREENSHOT = os.environ.get("ATTACH_SCREENSHOT", "true").lower() == "true"
 
 # Choose a vision-capable model. (You can change this any time.)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -38,7 +47,7 @@ class TaskParseResult(BaseModel):
         description="Extra context from the screenshot (short).",
     )
 
-    # NEW: date handling to avoid incorrectly setting task due dates
+    # Date handling to avoid incorrectly setting task due dates
     event_datetime: Optional[str] = Field(
         default=None,
         description=(
@@ -159,6 +168,59 @@ def todoist_quick_add(text: str, note: Optional[str] = None) -> dict:
     return r.json()
 
 
+def todoist_upload_file(file_name: str, file_bytes: bytes, content_type: str) -> dict:
+    """
+    Uploads a file to Todoist and returns uploaded file metadata.
+    """
+    if not TODOIST_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing TODOIST_TOKEN env var")
+
+    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+    data = {"file_name": file_name}
+    files = {"file": (file_name, file_bytes, content_type)}
+
+    r = requests.post(TODOIST_UPLOAD_URL, headers=headers, data=data, files=files, timeout=30)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Todoist upload error: {r.status_code} {r.text}")
+
+    return r.json()
+
+
+def todoist_add_item_note_with_attachment(item_id: str, content: str, file_attachment: dict) -> dict:
+    """
+    Adds an item note (comment) to a task with a file attachment.
+    """
+    if not TODOIST_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing TODOIST_TOKEN env var")
+
+    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+
+    commands = [
+        {
+            "type": "note_add",
+            "temp_id": str(uuid.uuid4()),
+            "uuid": str(uuid.uuid4()),
+            "args": {
+                "item_id": str(item_id),
+                "content": content,
+                "file_attachment": file_attachment,
+            },
+        }
+    ]
+
+    r = requests.post(
+        TODOIST_SYNC_URL,
+        headers=headers,
+        data={"commands": json.dumps_toggle(commands) if False else json.dumps(commands)},  # explicit json.dumps
+        timeout=30,
+    )
+
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Todoist note_add error: {r.status_code} {r.text}")
+
+    return r.json()
+
+
 def normalize_quick_add(q: str) -> str:
     q = q.strip()
 
@@ -240,6 +302,22 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
 
     task = todoist_quick_add(text=parsed.quick_add, note=parsed.notes)
 
+    # Attach original screenshot as a comment attachment (non-blocking)
+    attachment_result = None
+    if ATTACH_SCREENSHOT:
+        try:
+            upload_name = image.filename or "screenshot.png"
+            uploaded = todoist_upload_file(upload_name, image_bytes, content_type)
+
+            attachment_note = "📎 Original screenshot (from screenshot-to-todoist)"
+            attachment_result = todoist_add_item_note_with_attachment(
+                item_id=task["id"],
+                content=attachment_note,
+                file_attachment=uploaded,
+            )
+        except Exception as e:
+            attachment_result = {"error": str(e)}
+
     return JSONResponse(
         {
             "ok": True,
@@ -247,5 +325,6 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
             "quick_add": parsed.quick_add,
             "parsed": parsed.model_dump(),
             "task": task,
+            "attachment": attachment_result,
         }
     )
