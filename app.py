@@ -13,13 +13,11 @@ from openai import OpenAI
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 TODOIST_TOKEN = (os.environ.get("TODOIST_TOKEN") or "").strip()
 
-
 # Todoist Quick Add (Sync API v9) – deprecated but still the easiest way to parse natural language
 # You can swap this later if Todoist changes it.
 TODOIST_QUICK_ADD_URL = "https://api.todoist.com/sync/v9/quick/add"
 
 # Choose a vision-capable model. (You can change this any time.)
-# The OpenAI API supports image analysis through the Responses API. :contentReference[oaicite:2]{index=2}
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # Only auto-create tasks if confidence is high enough
@@ -39,6 +37,24 @@ class TaskParseResult(BaseModel):
         default=None,
         description="Extra context from the screenshot (short).",
     )
+
+    # NEW: date handling to avoid incorrectly setting task due dates
+    event_datetime: Optional[str] = Field(
+        default=None,
+        description=(
+            "Date/time mentioned in the image that refers to an event/appointment/"
+            "reservation/meeting (NOT a task deadline)."
+        ),
+    )
+    set_due: bool = Field(
+        default=False,
+        description="Whether to set a Todoist due date for the task.",
+    )
+    due_string: Optional[str] = Field(
+        default=None,
+        description="Todoist natural language due date (only if set_due=true). Example: 'tomorrow 3pm'.",
+    )
+
     reason: Optional[str] = Field(
         default=None,
         description="If should_create_task is false, explain why (short).",
@@ -62,17 +78,37 @@ Rules:
 
 Output must match the JSON schema exactly.
 
+IMPORTANT: Dates and times in the image are often EVENT dates, not TASK deadlines.
+
+You must classify any detected date/time into one of these:
+A) event_datetime (appointment/reservation/meeting/showtime/etc.)
+B) task_due (the deadline for when the user must complete the task)
+
+Rules for date/time handling:
+- If the user needs to do something BEFORE an event (e.g. “make a reservation for Saturday”):
+  - event_datetime = "Saturday"
+  - set_due = false
+  - include the event date in notes
+  - DO NOT put Saturday in due_string
+- Only set set_due=true when the image explicitly indicates a task deadline, such as:
+  - “by Friday”
+  - “due tomorrow”
+  - “remind me at 3pm”
+  - “submit before 5pm”
+  - “needs to be done today”
+  - “follow up on Tuesday” (and it’s clearly a deadline for the action)
+- If the message says the task is already complete (“reservation made”), do not create a follow-up task
+  unless there is a next action.
+
 Quick Add requirements:
 - Format: "<verb-led task title> p2 @inbox"
 - Keep it short (max ~120 chars).
-- If there is a time/date in the image, include it (e.g., "tomorrow", "Friday 3pm").
 - Use p1 only if urgent/production/sev/outage is implied; otherwise p2.
 - Use @work if work-related, otherwise @personal.
 - If the image contains specific proper nouns / field names / ticket IDs, include them in the task title.
 - Do NOT invent details that aren't in the image.
+- If there is a task deadline (NOT an event date), set set_due=true and put it in due_string.
 """
-
-
 
 app = FastAPI()
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -89,8 +125,6 @@ def parse_task_from_image(image_bytes: bytes, content_type: str) -> TaskParseRes
 
     data_url = to_data_url(image_bytes, content_type)
 
-    # Structured output parsing (schema-locked)
-    # OpenAI Structured Outputs guide: ensures schema adherence. :contentReference[oaicite:3]{index=3}
     resp = client.responses.parse(
         model=OPENAI_MODEL,
         input=[
@@ -124,6 +158,7 @@ def todoist_quick_add(text: str, note: Optional[str] = None) -> dict:
 
     return r.json()
 
+
 def normalize_quick_add(q: str) -> str:
     q = q.strip()
 
@@ -137,6 +172,24 @@ def normalize_quick_add(q: str) -> str:
 
     return q
 
+
+def apply_due_to_quick_add(quick_add: str, due_string: Optional[str], set_due: bool) -> str:
+    """
+    Only attach a due date string if the model explicitly marked it as a task due date.
+    This prevents event dates (appointments/reservations) from becoming task due dates.
+    """
+    if not set_due or not due_string:
+        return quick_add
+    return f"{quick_add} {due_string}".strip()
+
+
+def append_event_to_notes(notes: Optional[str], event_datetime: Optional[str]) -> Optional[str]:
+    if not event_datetime:
+        return notes
+    extra = f"Event time mentioned: {event_datetime}"
+    if notes:
+        return f"{notes}\n\n{extra}"
+    return extra
 
 
 @app.get("/health")
@@ -154,6 +207,13 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
     # Normalize early so dry_run also shows the final task formatting
     if parsed.quick_add:
         parsed.quick_add = normalize_quick_add(parsed.quick_add)
+
+    # Apply due date ONLY if it is explicitly a task deadline (not an event date)
+    if parsed.quick_add:
+        parsed.quick_add = apply_due_to_quick_add(parsed.quick_add, parsed.due_string, parsed.set_due)
+
+    # Always preserve event datetime as context (notes), not as due date
+    parsed.notes = append_event_to_notes(parsed.notes, parsed.event_datetime)
 
     if not parsed.should_create_task:
         return JSONResponse({"ok": True, "created": False, "parsed": parsed.model_dump()})
@@ -189,4 +249,3 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
             "task": task,
         }
     )
-
