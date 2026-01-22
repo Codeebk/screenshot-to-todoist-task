@@ -3,7 +3,7 @@ import base64
 import json
 import uuid
 import requests
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -26,6 +26,9 @@ TODOIST_UPLOAD_URL = "https://api.todoist.com/sync/v9/uploads/add"
 # Toggle screenshot attachment behavior
 ATTACH_SCREENSHOT = os.environ.get("ATTACH_SCREENSHOT", "true").lower() == "true"
 
+# Create reminder-like "event tasks" when a future event is present (dinner, appointment, flight, etc.)
+CREATE_EVENT_TASKS = os.environ.get("CREATE_EVENT_TASKS", "true").lower() == "true"
+
 # Choose a vision-capable model. (You can change this any time.)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -35,19 +38,22 @@ AUTO_CREATE_CONFIDENCE_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.70"
 
 # ====== Schema (Structured Output) ======
 class TaskParseResult(BaseModel):
+    # ACTION TASK (the thing you need to DO)
     should_create_task: bool = Field(
         description="True if the image contains a clear actionable task the user should do."
     )
     quick_add: Optional[str] = Field(
         default=None,
-        description="Todoist Quick Add string. Example: 'Email Bryan tomorrow p2 @work'",
-    )
-    notes: Optional[str] = Field(
-        default=None,
-        description="Extra context from the screenshot (short).",
+        description="Todoist Quick Add string for the ACTION task. Example: 'Email Bryan p2 @work'",
     )
 
-    # Date handling to avoid incorrectly setting task due dates
+    # Notes should be rare + only used when vital info doesn't fit in title
+    notes: Optional[str] = Field(
+        default=None,
+        description="Extra context from the screenshot (short). Should usually be null.",
+    )
+
+    # Date handling to avoid incorrectly setting ACTION task due dates
     event_datetime: Optional[str] = Field(
         default=None,
         description=(
@@ -57,11 +63,25 @@ class TaskParseResult(BaseModel):
     )
     set_due: bool = Field(
         default=False,
-        description="Whether to set a Todoist due date for the task.",
+        description="Whether to set a Todoist due date for the ACTION task.",
     )
     due_string: Optional[str] = Field(
         default=None,
-        description="Todoist natural language due date (only if set_due=true). Example: 'tomorrow 3pm'.",
+        description="Todoist natural language due date for the ACTION task (only if set_due=true).",
+    )
+
+    # EVENT REMINDER TASK (calendar-style reminder like: Dinner at X Saturday 6pm)
+    create_event_task: bool = Field(
+        default=False,
+        description="True if a reminder task should be created for the event itself.",
+    )
+    event_quick_add: Optional[str] = Field(
+        default=None,
+        description="Todoist Quick Add string for the EVENT reminder task. Example: 'Dinner at Fonda San Miguel p3 @personal'",
+    )
+    event_due_string: Optional[str] = Field(
+        default=None,
+        description="Todoist due string for the EVENT reminder, like 'Saturday 6pm'.",
     )
 
     reason: Optional[str] = Field(
@@ -69,54 +89,86 @@ class TaskParseResult(BaseModel):
         description="If should_create_task is false, explain why (short).",
     )
     confidence: float = Field(
-        ge=0.0, le=1.0, description="How confident you are that this is a correct task."
+        ge=0.0, le=1.0, description="How confident you are that this parse is correct."
     )
 
 
 SYSTEM_PROMPT = """
 You are a task-extraction assistant.
 
-You will be given an image (screenshot or photo). Decide if it contains an ACTION ITEM for the user.
+You will be given an image (screenshot or photo). Decide if it contains:
+- an ACTION ITEM the user must DO
+- and/or a future EVENT that should be remembered
 
 Rules:
-- Only output a task if the user needs to DO something.
 - Ignore UI chrome, headers, usernames, timestamps, reactions, menus, etc.
 - If it's a conversation/email/transcript, infer the most likely next action for the user.
-- Prefer ONE task. If multiple, pick the most important one.
-- Do NOT hedge with "maybe", "might", "possibly". Write the task directly.
+- Prefer ONE action task. If multiple, pick the most important one.
+- Do NOT hedge with "maybe", "might", "possibly". Write tasks directly.
 
 Output must match the JSON schema exactly.
 
-IMPORTANT: Dates and times in the image are often EVENT dates, not TASK deadlines.
+IMPORTANT: Dates/times in images are often EVENT dates, not ACTION deadlines.
 
-You must classify any detected date/time into one of these:
+Classify date/time into:
 A) event_datetime (appointment/reservation/meeting/showtime/etc.)
-B) task_due (the deadline for when the user must complete the task)
+B) action task due date (deadline)
 
-Rules for date/time handling:
-- If the user needs to do something BEFORE an event (e.g. “make a reservation for Saturday”):
-  - event_datetime = "Saturday"
+ACTION DATE RULES:
+- If the user needs to do something BEFORE an event (e.g. “make a reservation for Saturday at 6pm”):
+  - event_datetime = "Saturday 6pm"
   - set_due = false
-  - include the event date in notes
-  - DO NOT put Saturday in due_string
-- Only set set_due=true when the image explicitly indicates a task deadline, such as:
+  - DO NOT put "Saturday 6pm" in due_string for the action task
+- Only set set_due=true for the action task when the image explicitly indicates a deadline, such as:
   - “by Friday”
   - “due tomorrow”
   - “remind me at 3pm”
   - “submit before 5pm”
   - “needs to be done today”
-  - “follow up on Tuesday” (and it’s clearly a deadline for the action)
-- If the message says the task is already complete (“reservation made”), do not create a follow-up task
-  unless there is a next action.
+  - “follow up on Tuesday” (when it's clearly a deadline for the action)
 
-Quick Add requirements:
-- Format: "<verb-led task title> p2 @inbox"
+HARD RULE:
+- If the ACTION task is about making/booking/reserving/planning something for a future event,
+  then set_due MUST be false unless the screenshot explicitly states a deadline (e.g. "by Friday", "today", "ASAP").
+- Never use the event time (event_datetime) as the due date of the ACTION task.
+
+COMPLETED ACTIONS (very important):
+- If the screenshot indicates the action is already completed (e.g., "reservation made", "booked", "confirmed", "done"):
+  - Prefer should_create_task = false (informational only)
+  - Only create an action task if there is a clear next action (invite people, confirm attendees, pay invoice, etc.)
+
+EVENT REMINDER TASKS (important):
+- If the screenshot mentions a future plan/event (dinner, appointment, reservation time, meeting, flight, etc.):
+  - Prefer create_event_task = true
+  - event_quick_add should be a reminder-style title like:
+    "Dinner at Fonda San Miguel p3 @personal"
+  - event_due_string should be the event time (e.g., "Saturday 6pm")
+- This event reminder task should be created even if the action is already complete.
+- For the EVENT reminder task, it is correct/desirable to use the event date/time as the due date.
+
+Quick Add requirements (both action and event tasks):
+- Format: "<title> p2 @inbox"
 - Keep it short (max ~120 chars).
-- Use p1 only if urgent/production/sev/outage is implied; otherwise p2.
+- Use p1 only if urgent/production/sev/outage is implied.
 - Use @work if work-related, otherwise @personal.
-- If the image contains specific proper nouns / field names / ticket IDs, include them in the task title.
 - Do NOT invent details that aren't in the image.
-- If there is a task deadline (NOT an event date), set set_due=true and put it in due_string.
+
+RESERVATION ACTION TITLE RULE (hard rule):
+- If the user needs to book/make a reservation, the ACTION task title MUST start with:
+  "Make reservation at <place>"
+  Example: "Make reservation at Fonda San Miguel"
+- Do NOT use "Dinner at ..." for the ACTION task.
+- The "Dinner at ..." phrasing is only for the EVENT reminder task.
+
+TITLE VS NOTES:
+- Strong preference: keep key details in the title rather than notes.
+- Include key details in the title when it stays readable:
+  - who/where (restaurant/company/person)
+  - when (Tuesday 6pm)
+  - critical identifiers (ticket ID / field name)
+- notes should be NULL unless it adds vital information not captured in the title.
+- If notes are included, keep them brief (1–2 sentences).
+- Do NOT paste large blocks of transcript text into notes.
 """
 
 app = FastAPI()
@@ -141,7 +193,7 @@ def parse_task_from_image(image_bytes: bytes, content_type: str) -> TaskParseRes
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": "Extract the single best Todoist task from this image."},
+                    {"type": "input_text", "text": "Extract the best Todoist capture(s) from this image."},
                     {"type": "input_image", "image_url": data_url},
                 ],
             },
@@ -211,7 +263,7 @@ def todoist_add_item_note_with_attachment(item_id: str, content: str, file_attac
     r = requests.post(
         TODOIST_SYNC_URL,
         headers=headers,
-        data={"commands": json.dumps_toggle(commands) if False else json.dumps(commands)},  # explicit json.dumps
+        data={"commands": json.dumps(commands)},
         timeout=30,
     )
 
@@ -235,9 +287,47 @@ def normalize_quick_add(q: str) -> str:
     return q
 
 
-def apply_due_to_quick_add(quick_add: str, due_string: Optional[str], set_due: bool) -> str:
+def normalize_event_quick_add(q: str) -> str:
     """
-    Only attach a due date string if the model explicitly marked it as a task due date.
+    Event reminders should default to p3 if the model didn't specify.
+    """
+    q = q.strip()
+
+    if " p1" not in q and " p2" not in q and " p3" not in q:
+        q += " p3"
+
+    if "@work" not in q and "@personal" not in q and "@inbox" not in q:
+        q += " @personal"
+
+    return q
+
+
+def looks_like_same_datetime(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return False
+    return a.strip().lower() == b.strip().lower()
+
+
+def enforce_reservation_action_wording(action_quick_add: str) -> str:
+    """
+    If the model generates an ACTION task like 'Reservation at X', rewrite it to:
+      'Make reservation at X'
+    This ONLY affects the ACTION task, not the EVENT reminder task.
+    """
+    q = action_quick_add.strip()
+    lower = q.lower()
+
+    # Only rewrite if it looks like an ACTION reservation (not already "make reservation")
+    if lower.startswith("reservation at ") and "make reservation" not in lower:
+        q = "Make " + q  # -> "Make Reservation at ..."
+        q = q.replace("Make Reservation", "Make reservation", 1)
+
+    return q
+
+
+def apply_due_to_action_quick_add(quick_add: str, due_string: Optional[str], set_due: bool) -> str:
+    """
+    Only attach a due date string if the model explicitly marked it as a TASK deadline.
     This prevents event dates (appointments/reservations) from becoming task due dates.
     """
     if not set_due or not due_string:
@@ -245,7 +335,20 @@ def apply_due_to_quick_add(quick_add: str, due_string: Optional[str], set_due: b
     return f"{quick_add} {due_string}".strip()
 
 
+def build_event_quick_add_with_due(event_quick_add: str, event_due_string: Optional[str]) -> str:
+    """
+    For event reminder tasks, it is correct to include the event time as the due date.
+    """
+    if event_due_string:
+        return f"{event_quick_add} {event_due_string}".strip()
+    return event_quick_add
+
+
 def append_event_to_notes(notes: Optional[str], event_datetime: Optional[str]) -> Optional[str]:
+    """
+    Preserve event time as context, but do NOT treat it like a task due date.
+    Only add it to notes if it exists.
+    """
     if not event_datetime:
         return notes
     extra = f"Event time mentioned: {event_datetime}"
@@ -266,20 +369,42 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
 
     parsed = parse_task_from_image(image_bytes, content_type)
 
-    # Normalize early so dry_run also shows the final task formatting
+    # ===== Guardrail: never let ACTION due date equal EVENT time =====
+    # If an event reminder exists, the event time belongs ONLY on the event task.
+    if parsed.create_event_task and parsed.event_due_string and parsed.set_due and parsed.due_string:
+        if looks_like_same_datetime(parsed.due_string, parsed.event_due_string):
+            parsed.set_due = False
+            parsed.due_string = None
+
+    # ===== Normalize + build final strings =====
+    action_text: Optional[str] = None
+    event_text: Optional[str] = None
+
     if parsed.quick_add:
         parsed.quick_add = normalize_quick_add(parsed.quick_add)
+        parsed.quick_add = enforce_reservation_action_wording(parsed.quick_add)
+        parsed.quick_add = apply_due_to_action_quick_add(parsed.quick_add, parsed.due_string, parsed.set_due)
+        action_text = parsed.quick_add
 
-    # Apply due date ONLY if it is explicitly a task deadline (not an event date)
-    if parsed.quick_add:
-        parsed.quick_add = apply_due_to_quick_add(parsed.quick_add, parsed.due_string, parsed.set_due)
+    if parsed.event_quick_add:
+        parsed.event_quick_add = normalize_event_quick_add(parsed.event_quick_add)
+        event_text = build_event_quick_add_with_due(parsed.event_quick_add, parsed.event_due_string)
 
-    # Always preserve event datetime as context (notes), not as due date
+    # Preserve event datetime as context (notes), not as due date
     parsed.notes = append_event_to_notes(parsed.notes, parsed.event_datetime)
 
-    if not parsed.should_create_task:
+    # Only send notes if non-empty
+    note_to_send = parsed.notes if (parsed.notes and parsed.notes.strip()) else None
+
+    # Determine whether we will create anything
+    will_create_action = bool(parsed.should_create_task and action_text)
+    will_create_event = bool(CREATE_EVENT_TASKS and parsed.create_event_task and event_text)
+
+    # If nothing to do, return cleanly
+    if not will_create_action and not will_create_event:
         return JSONResponse({"ok": True, "created": False, "parsed": parsed.model_dump()})
 
+    # Safety rail: require confidence
     if parsed.confidence < AUTO_CREATE_CONFIDENCE_THRESHOLD:
         return JSONResponse(
             {
@@ -288,43 +413,80 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
                 "needs_review": True,
                 "threshold": AUTO_CREATE_CONFIDENCE_THRESHOLD,
                 "parsed": parsed.model_dump(),
+                "preview": {
+                    "will_create_action": will_create_action,
+                    "action_text": action_text,
+                    "will_create_event": will_create_event,
+                    "event_text": event_text,
+                },
             }
         )
 
+    # Dry run: show what WOULD happen
     if dry_run:
-        return JSONResponse({"ok": True, "created": False, "parsed": parsed.model_dump()})
-
-    if not parsed.quick_add:
-        raise HTTPException(
-            status_code=422,
-            detail="Model returned should_create_task=true but quick_add was empty",
+        return JSONResponse(
+            {
+                "ok": True,
+                "created": False,
+                "parsed": parsed.model_dump(),
+                "preview": {
+                    "will_create_action": will_create_action,
+                    "action_text": action_text,
+                    "will_create_event": will_create_event,
+                    "event_text": event_text,
+                },
+            }
         )
 
-    task = todoist_quick_add(text=parsed.quick_add, note=parsed.notes)
+    # ===== Create tasks =====
+    action_task: Optional[Dict[str, Any]] = None
+    event_task: Optional[Dict[str, Any]] = None
 
-    # Attach original screenshot as a comment attachment (non-blocking)
-    attachment_result = None
-    if ATTACH_SCREENSHOT:
+    if will_create_action and action_text:
+        action_task = todoist_quick_add(text=action_text, note=note_to_send)
+
+    if will_create_event and event_text:
+        # event tasks typically don't need notes (keep clean)
+        event_task = todoist_quick_add(text=event_text, note=None)
+
+    # ===== Attach original screenshot to any created task(s) =====
+    attachments: Dict[str, Any] = {"upload": None, "action_note": None, "event_note": None}
+    if ATTACH_SCREENSHOT and (action_task or event_task):
         try:
             upload_name = image.filename or "screenshot.png"
             uploaded = todoist_upload_file(upload_name, image_bytes, content_type)
+            attachments["upload"] = {"ok": True, "file_name": upload_name}
 
-            attachment_note = "📎 Original screenshot (from screenshot-to-todoist)"
-            attachment_result = todoist_add_item_note_with_attachment(
-                item_id=task["id"],
-                content=attachment_note,
-                file_attachment=uploaded,
-            )
+            attachment_note_text = "📎 Original screenshot (from screenshot-to-todoist)"
+
+            if action_task:
+                attachments["action_note"] = todoist_add_item_note_with_attachment(
+                    item_id=action_task["id"],
+                    content=attachment_note_text,
+                    file_attachment=uploaded,
+                )
+
+            if event_task:
+                attachments["event_note"] = todoist_add_item_note_with_attachment(
+                    item_id=event_task["id"],
+                    content=attachment_note_text,
+                    file_attachment=uploaded,
+                )
+
         except Exception as e:
-            attachment_result = {"error": str(e)}
+            attachments["upload"] = {"ok": False, "error": str(e)}
 
     return JSONResponse(
         {
             "ok": True,
             "created": True,
-            "quick_add": parsed.quick_add,
             "parsed": parsed.model_dump(),
-            "task": task,
-            "attachment": attachment_result,
+            "created_action_task": bool(action_task),
+            "created_event_task": bool(event_task),
+            "action_text": action_text,
+            "event_text": event_text,
+            "action_task": action_task,
+            "event_task": event_task,
+            "attachments": attachments,
         }
     )
