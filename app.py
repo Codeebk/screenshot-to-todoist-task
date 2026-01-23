@@ -2,8 +2,9 @@ import os
 import base64
 import json
 import uuid
+import time
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -23,17 +24,27 @@ TODOIST_QUICK_ADD_URL = "https://api.todoist.com/sync/v9/quick/add"
 TODOIST_SYNC_URL = "https://api.todoist.com/sync/v9/sync"
 TODOIST_UPLOAD_URL = "https://api.todoist.com/sync/v9/uploads/add"
 
+# REST v2 Projects endpoint (used to fetch dynamic project names)
+TODOIST_REST_PROJECTS_URL = "https://api.todoist.com/rest/v2/projects"
+
 # Toggle screenshot attachment behavior
 ATTACH_SCREENSHOT = os.environ.get("ATTACH_SCREENSHOT", "true").lower() == "true"
 
 # Create reminder-like "event tasks" when a future event is present (dinner, appointment, flight, etc.)
 CREATE_EVENT_TASKS = os.environ.get("CREATE_EVENT_TASKS", "true").lower() == "true"
 
+# Cache Todoist projects for performance
+PROJECT_CACHE_TTL_SECONDS = int(os.environ.get("PROJECT_CACHE_TTL_SECONDS", "600"))
+
 # Choose a vision-capable model. (You can change this any time.)
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # Only auto-create tasks if confidence is high enough
 AUTO_CREATE_CONFIDENCE_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.70"))
+
+
+# ====== Todoist Projects Cache ======
+_PROJECTS_CACHE: Dict[str, Any] = {"ts": 0.0, "names": ["Inbox"]}
 
 
 # ====== Schema (Structured Output) ======
@@ -44,7 +55,13 @@ class TaskParseResult(BaseModel):
     )
     quick_add: Optional[str] = Field(
         default=None,
-        description="Todoist Quick Add string for the ACTION task. Example: 'Email Bryan p2 @work'",
+        description="Todoist Quick Add string for the ACTION task. Example: 'Email Bryan p2'",
+    )
+
+    # Preferred project routing (dynamic per user; should be one of allowed project names)
+    project_name: Optional[str] = Field(
+        default=None,
+        description="Project name for the ACTION task. Must be chosen from allowed project list.",
     )
 
     # Notes should be rare + only used when vital info doesn't fit in title
@@ -77,7 +94,11 @@ class TaskParseResult(BaseModel):
     )
     event_quick_add: Optional[str] = Field(
         default=None,
-        description="Todoist Quick Add string for the EVENT reminder task. Example: 'Dinner at Fonda San Miguel p3 @personal'",
+        description="Todoist Quick Add string for the EVENT reminder task. Example: 'Dinner at Fonda San Miguel p3'",
+    )
+    event_project_name: Optional[str] = Field(
+        default=None,
+        description="Project name for the EVENT reminder task. Must be chosen from allowed project list.",
     )
     event_due_string: Optional[str] = Field(
         default=None,
@@ -93,7 +114,68 @@ class TaskParseResult(BaseModel):
     )
 
 
-SYSTEM_PROMPT = """
+def todoist_headers() -> Dict[str, str]:
+    if not TODOIST_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing TODOIST_TOKEN env var")
+    return {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+
+
+def todoist_list_projects_cached() -> List[str]:
+    """
+    Fetches Todoist projects dynamically for the current user.
+    Cached for PROJECT_CACHE_TTL_SECONDS to avoid frequent calls.
+
+    Returns a list of project names. Always includes "Inbox" as fallback.
+    """
+    now = time.time()
+
+    # If no token, we can't fetch user projects. Provide safe defaults.
+    if not TODOIST_TOKEN:
+        return ["Inbox", "Work", "Personal"]
+
+    # Serve cache if fresh
+    if _PROJECTS_CACHE.get("names") and (now - float(_PROJECTS_CACHE.get("ts", 0.0)) < PROJECT_CACHE_TTL_SECONDS):
+        return list(_PROJECTS_CACHE["names"])
+
+    try:
+        r = requests.get(TODOIST_REST_PROJECTS_URL, headers=todoist_headers(), timeout=15)
+        if r.status_code >= 300:
+            # fallback to old cache if available, else minimal defaults
+            if _PROJECTS_CACHE.get("names"):
+                return list(_PROJECTS_CACHE["names"])
+            return ["Inbox"]
+
+        projects = r.json()
+        names = [p.get("name") for p in projects if p.get("name")]
+        # Always include Inbox as a fallback even if user renamed their inbox (Todoist still uses it conceptually)
+        # For Quick Add, "#Inbox" works if there's an actual Inbox project visible; otherwise we simply won't append it.
+        # We'll still treat "Inbox" as the safe fallback string.
+        names = ["Inbox"] + [n for n in names if n != "Inbox"]
+
+        # Dedup preserving order
+        seen = set()
+        ordered = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+
+        _PROJECTS_CACHE["ts"] = now
+        _PROJECTS_CACHE["names"] = ordered
+        return ordered
+
+    except Exception:
+        # fallback
+        if _PROJECTS_CACHE.get("names"):
+            return list(_PROJECTS_CACHE["names"])
+        return ["Inbox"]
+
+
+def build_system_prompt_with_projects(project_names: List[str]) -> str:
+    # Keep list readable in prompt
+    allowed = ", ".join([f'"{p}"' for p in project_names[:50]])  # avoid super-long prompts
+
+    return f"""
 You are a task-extraction assistant.
 
 You will be given an image (screenshot or photo). Decide if it contains:
@@ -141,16 +223,22 @@ EVENT REMINDER TASKS (important):
 - If the screenshot mentions a future plan/event (dinner, appointment, reservation time, meeting, flight, etc.):
   - Prefer create_event_task = true
   - event_quick_add should be a reminder-style title like:
-    "Dinner at Fonda San Miguel p3 @personal"
+    "Dinner at Fonda San Miguel p3"
   - event_due_string should be the event time (e.g., "Saturday 6pm")
 - This event reminder task should be created even if the action is already complete.
 - For the EVENT reminder task, it is correct/desirable to use the event date/time as the due date.
 
+PROJECT ROUTING (important):
+- Choose exactly ONE project for the action task using project_name.
+- Choose exactly ONE project for the event reminder task using event_project_name.
+- You MUST choose from this allowed list:
+  [{allowed}]
+- If none fit well, use "Inbox".
+
 Quick Add requirements (both action and event tasks):
-- Format: "<title> p2 @inbox"
+- quick_add and event_quick_add should NOT include #ProjectName (the app will add it).
+- Include a priority like p2 or p3. Use p1 only if urgent/sev/outage is implied.
 - Keep it short (max ~120 chars).
-- Use p1 only if urgent/production/sev/outage is implied.
-- Use @work if work-related, otherwise @personal.
 - Do NOT invent details that aren't in the image.
 
 RESERVATION ACTION TITLE RULE (hard rule):
@@ -169,7 +257,8 @@ TITLE VS NOTES:
 - notes should be NULL unless it adds vital information not captured in the title.
 - If notes are included, keep them brief (1–2 sentences).
 - Do NOT paste large blocks of transcript text into notes.
-"""
+""".strip()
+
 
 app = FastAPI()
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -185,11 +274,13 @@ def parse_task_from_image(image_bytes: bytes, content_type: str) -> TaskParseRes
         raise HTTPException(status_code=500, detail="Missing OPENAI_API_KEY env var")
 
     data_url = to_data_url(image_bytes, content_type)
+    project_names = todoist_list_projects_cached()
+    system_prompt = build_system_prompt_with_projects(project_names)
 
     resp = client.responses.parse(
         model=OPENAI_MODEL,
         input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
@@ -205,10 +296,7 @@ def parse_task_from_image(image_bytes: bytes, content_type: str) -> TaskParseRes
 
 
 def todoist_quick_add(text: str, note: Optional[str] = None) -> dict:
-    if not TODOIST_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing TODOIST_TOKEN env var")
-
-    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+    headers = todoist_headers()
     data = {"text": text}
     if note:
         data["note"] = note
@@ -224,10 +312,7 @@ def todoist_upload_file(file_name: str, file_bytes: bytes, content_type: str) ->
     """
     Uploads a file to Todoist and returns uploaded file metadata.
     """
-    if not TODOIST_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing TODOIST_TOKEN env var")
-
-    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+    headers = todoist_headers()
     data = {"file_name": file_name}
     files = {"file": (file_name, file_bytes, content_type)}
 
@@ -242,10 +327,7 @@ def todoist_add_item_note_with_attachment(item_id: str, content: str, file_attac
     """
     Adds an item note (comment) to a task with a file attachment.
     """
-    if not TODOIST_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing TODOIST_TOKEN env var")
-
-    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+    headers = todoist_headers()
 
     commands = [
         {
@@ -274,15 +356,15 @@ def todoist_add_item_note_with_attachment(item_id: str, content: str, file_attac
 
 
 def normalize_quick_add(q: str) -> str:
+    """
+    Only ensure priority exists.
+    We no longer force @labels like @personal/@work.
+    Projects are assigned via #ProjectName (added by the app).
+    """
     q = q.strip()
 
-    # Ensure there's a priority
     if " p1" not in q and " p2" not in q and " p3" not in q:
         q += " p2"
-
-    # Ensure there's a label
-    if "@work" not in q and "@personal" not in q and "@inbox" not in q:
-        q += " @inbox"
 
     return q
 
@@ -295,9 +377,6 @@ def normalize_event_quick_add(q: str) -> str:
 
     if " p1" not in q and " p2" not in q and " p3" not in q:
         q += " p3"
-
-    if "@work" not in q and "@personal" not in q and "@inbox" not in q:
-        q += " @personal"
 
     return q
 
@@ -317,9 +396,8 @@ def enforce_reservation_action_wording(action_quick_add: str) -> str:
     q = action_quick_add.strip()
     lower = q.lower()
 
-    # Only rewrite if it looks like an ACTION reservation (not already "make reservation")
     if lower.startswith("reservation at ") and "make reservation" not in lower:
-        q = "Make " + q  # -> "Make Reservation at ..."
+        q = "Make " + q
         q = q.replace("Make Reservation", "Make reservation", 1)
 
     return q
@@ -357,9 +435,41 @@ def append_event_to_notes(notes: Optional[str], event_datetime: Optional[str]) -
     return extra
 
 
+def choose_project_or_inbox(project_name: Optional[str], allowed_projects: List[str]) -> str:
+    """
+    Enforces project selection from the allowed list.
+    Falls back to Inbox if invalid/missing.
+    """
+    if project_name and project_name in allowed_projects:
+        return project_name
+    return "Inbox"
+
+
+def apply_project_to_quick_add(quick_add: str, project_name: str, allowed_projects: List[str]) -> str:
+    """
+    Adds '#ProjectName' to the quick add string, but only if the project exists.
+    If project is Inbox, we skip adding '#Inbox' to avoid weirdness if it's not visible as a project.
+    """
+    # Clean any accidental existing #project fragments the model might have included
+    q = quick_add.strip()
+
+    # Pick a safe project
+    chosen = choose_project_or_inbox(project_name, allowed_projects)
+
+    if chosen == "Inbox":
+        return q
+
+    # Append project routing
+    return f"{q} #{chosen}".strip()
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/debug/projects")
+def debug_projects():
+    return {"projects": todoist_list_projects_cached()}
 
 
 @app.post("/ingest")
@@ -369,8 +479,9 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
 
     parsed = parse_task_from_image(image_bytes, content_type)
 
+    allowed_projects = todoist_list_projects_cached()
+
     # ===== Guardrail: never let ACTION due date equal EVENT time =====
-    # If an event reminder exists, the event time belongs ONLY on the event task.
     if parsed.create_event_task and parsed.event_due_string and parsed.set_due and parsed.due_string:
         if looks_like_same_datetime(parsed.due_string, parsed.event_due_string):
             parsed.set_due = False
@@ -384,11 +495,24 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
         parsed.quick_add = normalize_quick_add(parsed.quick_add)
         parsed.quick_add = enforce_reservation_action_wording(parsed.quick_add)
         parsed.quick_add = apply_due_to_action_quick_add(parsed.quick_add, parsed.due_string, parsed.set_due)
+
+        # Apply project routing
+        action_project = choose_project_or_inbox(parsed.project_name, allowed_projects)
+        parsed.project_name = action_project
+        parsed.quick_add = apply_project_to_quick_add(parsed.quick_add, action_project, allowed_projects)
+
         action_text = parsed.quick_add
 
     if parsed.event_quick_add:
         parsed.event_quick_add = normalize_event_quick_add(parsed.event_quick_add)
-        event_text = build_event_quick_add_with_due(parsed.event_quick_add, parsed.event_due_string)
+        event_built = build_event_quick_add_with_due(parsed.event_quick_add, parsed.event_due_string)
+
+        # Apply project routing
+        event_project = choose_project_or_inbox(parsed.event_project_name, allowed_projects)
+        parsed.event_project_name = event_project
+        event_built = apply_project_to_quick_add(event_built, event_project, allowed_projects)
+
+        event_text = event_built
 
     # Preserve event datetime as context (notes), not as due date
     parsed.notes = append_event_to_notes(parsed.notes, parsed.event_datetime)
@@ -416,8 +540,11 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
                 "preview": {
                     "will_create_action": will_create_action,
                     "action_text": action_text,
+                    "action_project": parsed.project_name,
                     "will_create_event": will_create_event,
                     "event_text": event_text,
+                    "event_project": parsed.event_project_name,
+                    "allowed_projects": allowed_projects,
                 },
             }
         )
@@ -432,8 +559,11 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
                 "preview": {
                     "will_create_action": will_create_action,
                     "action_text": action_text,
+                    "action_project": parsed.project_name,
                     "will_create_event": will_create_event,
                     "event_text": event_text,
+                    "event_project": parsed.event_project_name,
+                    "allowed_projects": allowed_projects,
                 },
             }
         )
@@ -488,5 +618,6 @@ async def ingest(image: UploadFile = File(...), dry_run: bool = False):
             "action_task": action_task,
             "event_task": event_task,
             "attachments": attachments,
+            "allowed_projects": allowed_projects,
         }
     )
